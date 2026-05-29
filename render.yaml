@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: ombre-brain
+    env: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: OMBRE_PORT=$PORT python server.py
+    envVars:
+      - key: OMBRE_TRANSPORT
+        value: streamable-http
+      - key: OMBRE_API_KEY
+        sync: false
+      - key: OMBRE_DEHYDRATION_BASE_URL
+        value: https://generativelanguage.googleapis.com/v1beta/openai/
+      - key: OMBRE_DEHYDRATION_MODEL
+        value: gemini-2.5-flash-lite
+      - key: OMBRE_EMBEDDING_BASE_URL
+        value: https://generativelanguage.googleapis.com/v1beta/openai/
+      - key: OMBRE_EMBEDDING_MODEL
+        value: gemini-embedding-001
+      - key: OMBRE_BUCKETS_DIR
+        value: /opt/render/project/src/buckets
+      - key: OMBRE_DASHBOARD_PASSWORD
+        sync: false
+    disk:
+      name: ombre-buckets
+      mountPath: /opt/render/project/src/buckets
+      sizeGB: 1
