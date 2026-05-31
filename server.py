@@ -235,7 +235,27 @@ def _create_session() -> str:
     return token
 
 
+def _get_app_token() -> str | None:
+    """Mobile app bearer token from OMBRE_APP_TOKEN env var."""
+    t = os.environ.get("OMBRE_APP_TOKEN", "").strip()
+    return t or None
+
+
+def _bearer_token_valid(request) -> bool:
+    """True if Authorization: Bearer matches OMBRE_APP_TOKEN."""
+    app_token = _get_app_token()
+    if not app_token:
+        return False
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return False
+    supplied = auth[7:].strip()
+    return hmac.compare_digest(supplied, app_token)
+
+
 def _is_authenticated(request) -> bool:
+    if _bearer_token_valid(request):
+        return True
     token = request.cookies.get("ombre_session")
     if not token:
         return False
@@ -1535,6 +1555,186 @@ async def dream() -> str:
     final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
+
+
+# =============================================================
+# Mobile / REST tool API (wraps MCP tools for LanClaude app)
+# =============================================================
+
+async def _read_json_body(request) -> dict:
+    try:
+        body = await request.json()
+        return body if isinstance(body, dict) else {}
+    except Exception:
+        return {}
+
+
+def _tool_json_response(text: str):
+    from starlette.responses import JSONResponse
+    return JSONResponse({"ok": True, "result": text})
+
+
+@mcp.custom_route("/api/breath", methods=["POST"])
+async def api_breath(request):
+    """REST wrapper for breath() tool."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    body = await _read_json_body(request)
+    try:
+        text = await breath(
+            query=body.get("query", ""),
+            mode=body.get("mode", ""),
+            max_tokens=int(body.get("max_tokens", 10000)),
+            domain=body.get("domain", ""),
+            valence=float(body.get("valence", -1)),
+            arousal=float(body.get("arousal", -1)),
+            max_results=int(body.get("max_results", 20)),
+            importance_min=int(body.get("importance_min", -1)),
+        )
+        return _tool_json_response(text)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/hold", methods=["POST"])
+async def api_hold(request):
+    """REST wrapper for hold() tool."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    body = await _read_json_body(request)
+    if not body.get("content", "").strip():
+        return JSONResponse({"ok": False, "error": "content required"}, status_code=400)
+    try:
+        text = await hold(
+            content=body.get("content", ""),
+            tags=body.get("tags", ""),
+            importance=int(body.get("importance", -1)),
+            pinned=bool(body.get("pinned", False)),
+            feel=bool(body.get("feel", False)),
+            source_bucket=body.get("source_bucket", ""),
+            valence=float(body.get("valence", -1)),
+            arousal=float(body.get("arousal", -1)),
+            memory_kind=body.get("memory_kind", ""),
+            task_due=body.get("task_due", ""),
+            source_quote=body.get("source_quote", ""),
+            session_id=body.get("session_id", ""),
+            inferred=bool(body.get("inferred", True)),
+        )
+        return _tool_json_response(text)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/grow", methods=["POST"])
+async def api_grow(request):
+    """REST wrapper for grow() tool."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    body = await _read_json_body(request)
+    if not body.get("content", "").strip():
+        return JSONResponse({"ok": False, "error": "content required"}, status_code=400)
+    try:
+        text = await grow(content=body.get("content", ""))
+        return _tool_json_response(text)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/trace", methods=["POST"])
+async def api_trace(request):
+    """REST wrapper for trace() tool."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    body = await _read_json_body(request)
+    if not body.get("bucket_id", "").strip():
+        return JSONResponse({"ok": False, "error": "bucket_id required"}, status_code=400)
+    try:
+        text = await trace(
+            bucket_id=body.get("bucket_id", ""),
+            name=body.get("name", ""),
+            domain=body.get("domain", ""),
+            valence=float(body.get("valence", -1)),
+            arousal=float(body.get("arousal", -1)),
+            importance=int(body.get("importance", -1)),
+            tags=body.get("tags", ""),
+            resolved=int(body.get("resolved", -1)),
+            pinned=int(body.get("pinned", -1)),
+            digested=int(body.get("digested", -1)),
+            task_status=body.get("task_status", ""),
+            content=body.get("content", ""),
+            delete=bool(body.get("delete", False)),
+        )
+        return _tool_json_response(text)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/dream", methods=["POST"])
+async def api_dream(request):
+    """REST wrapper for dream() tool."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        text = await dream()
+        return _tool_json_response(text)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/pulse", methods=["POST"])
+async def api_pulse(request):
+    """REST wrapper for pulse() tool."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    body = await _read_json_body(request)
+    try:
+        text = await pulse(include_archive=bool(body.get("include_archive", False)))
+        return _tool_json_response(text)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/about-me", methods=["GET"])
+async def api_about_me(request):
+    """High-importance memories for 'about user' screen."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        min_imp = int(request.query_params.get("importance_min", "7"))
+    except ValueError:
+        min_imp = 7
+    try:
+        limit = min(int(request.query_params.get("limit", "30")), 100)
+    except ValueError:
+        limit = 30
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        filtered = [
+            b for b in all_buckets
+            if int(b["metadata"].get("importance", 0)) >= min_imp
+            and b["metadata"].get("type") not in ("feel",)
+        ]
+        filtered.sort(
+            key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True
+        )
+        items = [_bucket_api_dict(b, include_content=True) for b in filtered[:limit]]
+        return JSONResponse(items)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # =============================================================
