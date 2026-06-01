@@ -1906,6 +1906,20 @@ async def api_diary_ledger(request):
     return await api_diary(request)
 
 
+@mcp.custom_route("/api/diary-ledger/has-daily", methods=["GET"])
+async def api_diary_has_daily(request):
+    """Must register before /api/diary-ledger/{ledger_id} or 'has-daily' is treated as an id."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    date = request.query_params.get("date", "").strip()[:10]
+    if not date:
+        return JSONResponse({"error": "date required (YYYY-MM-DD)"}, status_code=400)
+    has = await diary_ledger.has_daily_for_date(date)
+    return JSONResponse({"has_daily": has})
+
+
 @mcp.custom_route("/api/diary-ledger/{ledger_id}", methods=["GET"])
 async def api_diary_ledger_detail(request):
     from starlette.responses import JSONResponse
@@ -1928,19 +1942,6 @@ async def api_diary_ledger_detail(request):
         "content": entry.get("content", ""),
         "original_content": entry.get("content", ""),
     })
-
-
-@mcp.custom_route("/api/diary-ledger/has-daily", methods=["GET"])
-async def api_diary_has_daily(request):
-    from starlette.responses import JSONResponse
-    err = _require_auth(request)
-    if err:
-        return err
-    date = request.query_params.get("date", "").strip()[:10]
-    if not date:
-        return JSONResponse({"error": "date required (YYYY-MM-DD)"}, status_code=400)
-    has = await diary_ledger.has_daily_for_date(date)
-    return JSONResponse({"has_daily": has})
 
 
 @mcp.custom_route("/api/diary-ledger", methods=["POST"])
