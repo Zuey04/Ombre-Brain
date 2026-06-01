@@ -108,7 +108,21 @@ memory_kind 可选：diary（默认）| moment | mood | relationship | task
   内心: ["回忆", "梦境", "自省"]
   事务: ["计划", "财务"]
 importance: 日记类 3~5，task 类 5~7
-valence/arousal: 0~1"""
+valence/arousal: 0~1
+
+diary_ui_tags 规则同上；**禁止** diary:entry。"""
+
+
+DAILY_DIARY_PROMPT = """你是私人日终日记写手。根据用户提供的 24 小时聊天记录，写一篇第三人称日终日记（用「她」指代用户），总结今天发生的事、情绪与关系变化。
+
+规则：
+1. **不要**复制聊天气泡原文；用叙述体写 AI 总结
+2. **不要**提取待办、不要 bullet 清单
+3. 800~1500 字以内，有温度
+4. 没有实质内容的闲聊日可写短一些（300 字+）
+
+输出纯 JSON：
+{"name": "YYYY-MM-DD 日记", "content": "正文"}"""
 
 
 # --- Merge prompt: instruct LLM to blend old and new memories ---
@@ -147,9 +161,20 @@ ANALYZE_PROMPT = """你是一个日常聊天内容分析器。分析文本是日
    内心: ["回忆", "梦境", "自省"]
    事务: ["计划", "财务"]
 4. valence（0~1）和 arousal（0~1）
-5. tags: 3~10 个关键词
+5. tags: 3~10 个关键词 + **可选** diary_ui_tags（见下）
 6. suggested_name: 10字以内的日记式标题
 7. importance: 日记类 3~5，task 类 5~7
+
+**diary_ui_tags**（与 App 日记 Tab 对齐，写入 tags 数组；仅当内容值得分类展示时添加；衰减由服务端 decay 引擎按 tag 处理，此处无需填写）：
+- `diary:about_view` — 眼中的她：第三人称总结「她是什么样的人/你怎么看她」
+- `diary:mood_turn` — 她的心情拐点（不是每日晴雨表）
+- `diary:health` — 她的健康/作息
+- `diary:period` — 经期（含日期、疼x分等）
+- `diary:open_thread` — 悬着的事/未完的线头
+- `diary:debate` — 交锋、翻车、争执记录
+- `diary:user_quote` — 她随口的金句
+- `diary:special_claude` / `diary:special_user` — 双写 special moment
+- **禁止** 在 hold/grow 中使用 `diary:entry`（日终「日记」子区仅由系统 24h 自动生成）
 
 输出格式（纯 JSON，无其他内容）：
 {
@@ -550,7 +575,7 @@ class Dehydrator:
             "domain": result.get("domain", ["未分类"])[:3],
             "valence": valence,
             "arousal": arousal,
-            "tags": result.get("tags", [])[:15],
+            "tags": _sanitize_hold_tags(result.get("tags", []))[:15],
             "suggested_name": str(result.get("suggested_name", ""))[:20],
             "importance": max(1, min(10, int(result.get("importance", 4)))),
             "task_due": str(result.get("task_due", ""))[:32],
@@ -680,9 +705,56 @@ class Dehydrator:
                 "domain": item.get("domain", ["未分类"])[:3],
                 "valence": valence,
                 "arousal": arousal,
-                "tags": item.get("tags", [])[:15],
+                "tags": _sanitize_hold_tags(item.get("tags", []))[:15],
                 "importance": importance,
                 "task_due": str(item.get("task_due", ""))[:32],
                 "source_quote": str(item.get("source_quote", ""))[:500],
             })
         return validated
+
+    async def generate_daily_diary(self, chat_transcript: str, diary_date: str) -> dict:
+        """Generate end-of-day diary entry (ledger only, not memory)."""
+        if not chat_transcript or not chat_transcript.strip():
+            return {"name": f"{diary_date} 日记", "content": "今天没有可记录的对话。"}
+        if not self.api_available:
+            raise RuntimeError("脱水 API 不可用，无法生成日终日记")
+
+        user_msg = f"日期：{diary_date}\n\n聊天记录：\n{chat_transcript[:12000]}"
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": DAILY_DIARY_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            max_tokens=2048,
+            temperature=0.3,
+        )
+        if not response.choices:
+            raise RuntimeError("日终日记 API 返回空")
+        raw = response.choices[0].message.content or ""
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        try:
+            data = json.loads(cleaned)
+            if isinstance(data, dict) and data.get("content"):
+                return {
+                    "name": str(data.get("name", f"{diary_date} 日记"))[:40],
+                    "content": str(data.get("content", "")).strip(),
+                }
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return {"name": f"{diary_date} 日记", "content": raw.strip()}
+
+
+def _sanitize_hold_tags(tags: list) -> list:
+    """Strip diary:entry from model tags on hold/grow paths."""
+    from diary_tags import ENTRY
+
+    out = []
+    for t in tags:
+        s = str(t).strip()
+        if not s or s == ENTRY:
+            continue
+        out.append(s)
+    return out

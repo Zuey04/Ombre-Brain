@@ -24,6 +24,8 @@ import asyncio
 import logging
 from datetime import datetime
 
+from diary_tags import decay_lambda_multiplier, open_thread_decay_frozen
+
 logger = logging.getLogger("ombre_brain.decay")
 
 
@@ -198,10 +200,17 @@ class DecayEngine:
             )
 
         # --- Base score: importance + activation_count 为主 ---
+        tags = metadata.get("tags", [])
+        if not isinstance(tags, list):
+            tags = []
+        lambda_mult = decay_lambda_multiplier(tags)
+        # 悬着的事：未 resolved 时冻结指数衰减（days=0 → e^0=1）
+        decay_days = 0.0 if open_thread_decay_frozen(metadata) else days_since
+
         base_score = (
             importance * self.importance_multiplier
             * (activation_count ** self.activation_exponent)
-            * math.exp(-self.decay_lambda * days_since)
+            * math.exp(-self.decay_lambda * lambda_mult * decay_days)
             * combined_weight
         )
 

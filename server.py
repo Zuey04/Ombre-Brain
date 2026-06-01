@@ -43,6 +43,7 @@ import secrets
 import time
 import json as _json_lib
 import httpx
+from datetime import datetime
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -54,6 +55,8 @@ from mcp.server.fastmcp import FastMCP
 from bucket_manager import BucketManager
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
+from diary_ledger import DiaryLedger, ledger_to_api_dict
+from diary_tags import diary_section_label, ledger_mirror_tags, parse_tags_param
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
@@ -101,6 +104,7 @@ embedding_engine = EmbeddingEngine(config)            # Embedding engine first (
 bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket manager / 记忆桶管理器
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
+diary_ledger = DiaryLedger(config["buckets_dir"])
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 
 DIARY_CFG = config.get("diary_mode", {})
@@ -114,6 +118,22 @@ def _effective_merge_threshold() -> int:
     if DIARY_MODE:
         return int(DIARY_CFG.get("merge_threshold", config.get("merge_threshold", 85)))
     return int(config.get("merge_threshold", 75))
+
+
+async def _mirror_to_ledger(content: str, tags: list, name: str = "") -> None:
+    """Copy hold/grow summaries into permanent diary ledger (no decay, no breath)."""
+    mirror = ledger_mirror_tags(tags)
+    if not mirror or not content or not content.strip():
+        return
+    try:
+        await diary_ledger.create(
+            content=content.strip(),
+            tags=mirror,
+            name=name,
+            source="hold_mirror",
+        )
+    except Exception as e:
+        logger.warning(f"Diary ledger mirror failed / 日记底档镜像失败: {e}")
 
 
 def _bucket_api_dict(b: dict, include_content: bool = False) -> dict:
@@ -139,6 +159,7 @@ def _bucket_api_dict(b: dict, include_content: bool = False) -> dict:
         "has_original": bool(meta.get("original_content")),
         "created": meta.get("created", ""),
         "last_active": meta.get("last_active", ""),
+        "diary_section": diary_section_label(meta.get("tags", [])),
         "score": decay_engine.calculate_score(meta),
     }
     if include_content:
@@ -1057,7 +1078,7 @@ async def hold(
     if not content or not content.strip():
         return "内容为空，无法存储。"
 
-    extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
+    extra_tags = parse_tags_param(tags)
 
     # --- Feel mode: store as feel type, minimal metadata ---
     # --- Feel 模式：存为 feel 类型，最少元数据 ---
@@ -1160,6 +1181,8 @@ async def hold(
         session_id=session_id,
     )
 
+    await _mirror_to_ledger(content, all_tags, suggested_name or result_name)
+
     kind_icon = "☑️" if final_kind == "task" else "📔"
     action = "合并→" if is_merged else "新建→"
     return f"{kind_icon}{action}{result_name} [{final_kind}] {','.join(domain)}"
@@ -1206,6 +1229,11 @@ async def grow(content: str) -> str:
             task_due=analysis.get("task_due", ""),
             source_quote=analysis.get("source_quote", ""),
         )
+        await _mirror_to_ledger(
+            content.strip(),
+            analysis.get("tags", []),
+            analysis.get("suggested_name", result_name),
+        )
         kind = analysis.get("memory_kind", "diary")
         action = "合并" if is_merged else "新建"
         return f"{action} → {result_name} [{kind}] | {','.join(analysis.get('domain', []))}"
@@ -1243,6 +1271,12 @@ async def grow(content: str) -> str:
             )
 
             icon = "☑️" if item.get("memory_kind") == "task" else "📔"
+            item_tags = item.get("tags", [])
+            await _mirror_to_ledger(
+                item["content"],
+                item_tags,
+                item.get("name", result_name),
+            )
             if is_merged:
                 results.append(f"📎{icon}{result_name}")
                 merged += 1
@@ -1790,6 +1824,22 @@ async def api_bucket_detail(request):
     err = _require_auth(request)
     if err: return err
     bucket_id = request.path_params["bucket_id"]
+    if bucket_id.startswith("ledger_"):
+        entry = await diary_ledger.get(bucket_id)
+        if not entry:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return JSONResponse({
+            "id": entry["id"],
+            "metadata": {
+                "name": entry.get("name", ""),
+                "memory_kind": "ledger",
+                "tags": entry.get("tags", []),
+                "created": entry.get("created", ""),
+                "has_original": True,
+            },
+            "content": entry.get("content", ""),
+            "original_content": entry.get("content", ""),
+        })
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -1835,24 +1885,134 @@ async def api_timeline(request):
 
 @mcp.custom_route("/api/diary", methods=["GET"])
 async def api_diary(request):
-    """Diary entries for a given date (YYYY-MM-DD) or all recent."""
+    """Permanent diary ledger (no decay, excluded from breath)."""
     from starlette.responses import JSONResponse
     err = _require_auth(request)
     if err:
         return err
     date = request.query_params.get("date", "")
     try:
-        if date:
-            buckets = await bucket_mgr.filter_buckets(
-                memory_kind="diary", date_from=date, date_to=date
-            )
-        else:
-            buckets = await bucket_mgr.filter_buckets(memory_kind="diary")
-        items = [_bucket_api_dict(b, include_content=True) for b in buckets]
+        entries = await diary_ledger.list_entries(date=date or None)
+        items = [ledger_to_api_dict(e, include_content=True) for e in entries]
         items.sort(key=lambda x: x.get("created", ""), reverse=True)
         return JSONResponse(items)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/diary-ledger", methods=["GET"])
+async def api_diary_ledger(request):
+    """Alias of /api/diary — permanent diary tab source."""
+    return await api_diary(request)
+
+
+@mcp.custom_route("/api/diary-ledger/{ledger_id}", methods=["GET"])
+async def api_diary_ledger_detail(request):
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    ledger_id = request.path_params["ledger_id"]
+    entry = await diary_ledger.get(ledger_id)
+    if not entry:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({
+        "id": entry["id"],
+        "metadata": {
+            "name": entry.get("name", ""),
+            "memory_kind": "ledger",
+            "tags": entry.get("tags", []),
+            "created": entry.get("created", ""),
+            "has_original": True,
+        },
+        "content": entry.get("content", ""),
+        "original_content": entry.get("content", ""),
+    })
+
+
+@mcp.custom_route("/api/diary-ledger/has-daily", methods=["GET"])
+async def api_diary_has_daily(request):
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    date = request.query_params.get("date", "").strip()[:10]
+    if not date:
+        return JSONResponse({"error": "date required (YYYY-MM-DD)"}, status_code=400)
+    has = await diary_ledger.has_daily_for_date(date)
+    return JSONResponse({"has_daily": has})
+
+
+@mcp.custom_route("/api/diary-ledger", methods=["POST"])
+async def api_create_diary_ledger(request):
+    """Save client-generated daily diary to ledger (no server LLM)."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    diary_date = (body.get("date") or "").strip()[:10]
+    content = (body.get("content") or "").strip()
+    name = (body.get("name") or "").strip()
+    source = (body.get("source") or "app").strip()[:32]
+    if not diary_date or not content:
+        return JSONResponse({"error": "date and content required"}, status_code=400)
+
+    if await diary_ledger.has_daily_for_date(diary_date):
+        return JSONResponse({
+            "ok": True,
+            "skipped": True,
+            "reason": f"daily diary already exists for {diary_date}",
+        })
+
+    from diary_tags import DAILY, ENTRY
+
+    lid = await diary_ledger.create(
+        content=content,
+        tags=[ENTRY, DAILY],
+        name=name or f"{diary_date} 日记",
+        diary_date=diary_date,
+        source=source,
+    )
+    return JSONResponse({"ok": True, "ledger_id": lid, "date": diary_date})
+
+
+@mcp.custom_route("/api/diary/generate-daily", methods=["POST"])
+async def api_generate_daily_diary(request):
+    """Deprecated: daily diary is generated by the App LLM, then POST /api/diary-ledger."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    content = (body.get("content") or "").strip()
+    diary_date = (body.get("date") or "").strip()[:10]
+    if content and diary_date:
+        if await diary_ledger.has_daily_for_date(diary_date):
+            return JSONResponse({"ok": True, "skipped": True})
+        from diary_tags import DAILY, ENTRY
+        lid = await diary_ledger.create(
+            content=content,
+            tags=[ENTRY, DAILY],
+            name=(body.get("name") or f"{diary_date} 日记"),
+            diary_date=diary_date,
+            source=body.get("source", "app_legacy"),
+        )
+        return JSONResponse({"ok": True, "ledger_id": lid})
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": "Use LanClaude App to generate daily diary (Claude), then POST /api/diary-ledger",
+        },
+        status_code=400,
+    )
 
 
 @mcp.custom_route("/api/tasks", methods=["GET"])
