@@ -66,8 +66,8 @@ dehydration:
   #   vLLM:        http://localhost:8000/v1
   #   Gemini:      https://generativelanguage.googleapis.com/v1beta/openai
   # api_key: ""    # ⚠️ Use env var OMBRE_API_KEY instead / 请使用环境变量 OMBRE_API_KEY
-  max_tokens: 1024
-  temperature: 0.1
+  max_tokens: 2048   # 规程类记忆 summary 需保留分节，避免截断
+  temperature: 0.15  # 略提高，减少「压成标签句」的过度概括
   # --- Storage / 存储：正文存压缩版，frontmatter.original_content 存原文 ---
   store_compressed_body: true     # hold/grow 写入时压缩正文，原文单独存档
 

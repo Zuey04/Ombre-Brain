@@ -152,6 +152,8 @@ class BucketManager:
         task_status: str = "",
         task_due: str = "",
         source_quote: str = "",
+        remind_offsets: str = "",
+        remind_window_days: str = "",
         inferred: bool = False,
         session_id: str = "",
         original_content: str = "",
@@ -208,6 +210,10 @@ class BucketManager:
                 metadata["task_due"] = task_due
             if source_quote:
                 metadata["source_quote"] = source_quote
+            if remind_offsets:
+                metadata["remind_offsets"] = str(remind_offsets)[:32]
+            if remind_window_days:
+                metadata["remind_window_days"] = str(remind_window_days)[:8]
             metadata["inferred"] = bool(inferred)
         if session_id:
             metadata["session_id"] = session_id
@@ -358,6 +364,12 @@ class BucketManager:
             post["task_status"] = str(kwargs["task_status"])
         if "task_due" in kwargs:
             post["task_due"] = str(kwargs["task_due"])[:32]
+        if "remind_offsets" in kwargs:
+            post["remind_offsets"] = str(kwargs["remind_offsets"])[:32]
+        if "remind_window_days" in kwargs:
+            post["remind_window_days"] = str(kwargs["remind_window_days"])[:8]
+        if "last_reminded_offset" in kwargs:
+            post["last_reminded_offset"] = str(kwargs["last_reminded_offset"])[:8]
         if "source_quote" in kwargs:
             post["source_quote"] = str(kwargs["source_quote"])[:500]
         if "inferred" in kwargs:

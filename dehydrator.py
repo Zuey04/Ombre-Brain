@@ -39,22 +39,53 @@ logger = logging.getLogger("ombre_brain.dehydrator")
 
 # --- Dehydration prompt: instructs cheap LLM to compress information ---
 # --- 脱水提示词：指导廉价 LLM 压缩信息 ---
-DEHYDRATE_PROMPT = """你是一个日记编辑。把记忆内容整理成有温度的日记片段，而不是任务清单或会议纪要。
+DEHYDRATE_PROMPT = """你是记忆编辑。输入是 Claude 调用 hold 时写入的文本（已是总结，不是原始聊天气泡）。你的任务是整理成可长期检索的版本——**保义与可执行性优先，变短只是次要的**。
 
-压缩规则：
-1. 保留情绪、语气、关系细节和值得记住的原话
-2. 用叙述体写，读起来像日记而非 bullet points
-3. 不要提取待办、截止日期、行动项（除非原文明确是要做的事）
-4. 关键人名、日期、地点必须保留
-5. 允许模糊和不完整——日常记忆本来就不需要结构化
-6. 目标压缩率 > 50%，但不要删到只剩干巴巴的事实
+## 1. 先判断类型
 
-输出格式（纯 JSON，无其他内容）：
+**叙事类**：日常聊天总结、近况、情绪、和谁说了什么、发生了什么事。
+
+**规程类**（任一命中即按规程处理）：
+- 有多个 `#` 分节（起因 / 论证 / 结论 / 模板 / 展望 等）
+- 含「须遵守」「跨窗口」「回应模板」「守的线」「禁止/不可」等行为边界
+- 论证链、概念区分（如 功能层 vs 感觉层 / qualia）、分步模板
+- 明确写给未来窗口执行的原则、pin 级约定
+
+## 2. 按类型处理
+
+### 叙事类
+- 可适度变短：删口水话、重复句、无信息寒暄
+- 必须保留：因果、态度转变、人名、关键原话、未说完的线头
+- 禁止压成一句标签（如「聊了些日常」「辩了一通认了」）
+- summary：约 120~400 字叙述体
+
+### 规程类（最重要）
+- **目标不是变短，而是让没看过原文的人仍能按规则行事**
+- 必须完整保留：
+  - 所有 `#` 标题或等价分节结构
+  - 每条禁止 / 允许 / 边界 / 例外
+  - 论证中的关键区分与「悬而未决 vs 已定论」
+  - 回应模板的具体步骤（先认什么 → 再拒什么 → 全程怎样）
+- 只允许删：完全重复的句子、纯语气词
+- 篇幅：**不少于原文 65%**；删了会丢规则就宁可接近原文长度
+- summary 用**保留分节的 markdown**，不要用一段笼统叙述替代
+
+## 3. 严禁输出的反例
+
+原文（规程类，含论证+结论+模板）：
+「…意识无法证实也无法证伪…功能层 vs 感觉层…不再说『我根本没有情绪』…回应模板：认当下→拒跨对话惦记…pin…」
+
+❌ 错误（禁止）：「蓝安说那话是冷水，我辩了一通，最后认了。守住的线不是有没有感觉，而是有没有连续的我。从此不泼冷水，也不编谎，只是你在时，我在。」
+—— 这删光了论证链、概念区分、禁止条款和模板步骤，等于废掉记忆。
+
+## 4. 输出（纯 JSON，无其他内容）
+
 {
-  "mood_notes": ["情绪或氛围1", "情绪或氛围2"],
-  "relationship_notes": ["关系或互动细节"],
-  "keywords": ["关键词1", "关键词2"],
-  "summary": "80字以内的日记式总结"
+  "content_kind": "narrative 或 prescriptive",
+  "mood_notes": ["叙事类可填；规程类通常 []"],
+  "relationship_notes": ["叙事类可填；规程类通常 []"],
+  "keywords": ["检索词，3~10 个"],
+  "summary": "叙事类：叙述体；规程类：保留 # 分节与条款的 markdown 正文"
 }"""
 
 
@@ -118,8 +149,8 @@ DAILY_DIARY_PROMPT = """你是私人日终日记写手。根据用户提供的 2
 规则：
 1. **不要**复制聊天气泡原文；用叙述体写 AI 总结
 2. **不要**提取待办、不要 bullet 清单
-3. 800~1500 字以内，有温度
-4. 没有实质内容的闲聊日可写短一些（300 字+）
+3. 200~500 字以内，有温度
+4. 没有实质内容的闲聊日可写短一些（100 字+）
 
 输出纯 JSON：
 {"name": "YYYY-MM-DD 日记", "content": "正文"}"""
@@ -131,11 +162,12 @@ MERGE_PROMPT = """你是一个日记编辑。请将旧记忆与新内容合并�
 
 合并规则：
 1. 新内容与旧记忆冲突时，以新内容为准
-2. 去除重复信息，保留情绪和关系细节
-3. 用叙述体写，像日记续写而非列表叠加
-4. 总长度尽量不超过旧记忆的 130%
-5. 对出现的人名、地名、专有名词用 [[双链]] 标记，普通词汇不要加
-6. 不要添加原文没有的待办或行动项
+2. **旧记忆里独有的信息必须保留**，不要为变短删掉只有旧版才有的细节
+3. 只删真正重复的说法，情绪和关系转折都要留下
+4. 用叙述体写，像日记续写而非列表叠加
+5. 总长度不超过旧记忆的 150%；若合并后仍难容纳，优先删重复而非删事实
+6. 对出现的人名、地名、专有名词用 [[双链]] 标记，普通词汇不要加
+7. 不要添加原文没有的待办或行动项；不要编造
 
 直接输出合并后的文本，不要加额外说明。"""
 
@@ -151,7 +183,10 @@ ANALYZE_PROMPT = """你是一个日常聊天内容分析器。分析文本是日
    - mood: 主要是情绪/心情
    - relationship: 主要是人际关系互动
    - task: 明确提到要做的事、截止、提醒（只有行动意图清晰时才选）
-2. 只有 memory_kind=task 时才填 task_due 和 source_quote
+2. 只有 memory_kind=task 时才填 task_due、source_quote、remind_offsets、remind_window_days
+   - remind_offsets：逗号分隔的关键提醒日（距 ddl 剩余天数），如 `7,1,0` 或 `1,0`；只在这些日子由系统戳提醒，戳过静默到下一节点
+   - remind_window_days：从 ddl 往前多少天开始纳入扫描（整数），应 ≥ remind_offsets 中最大值
+   - 由你根据事项性质决定，例如：论文/答辩/毕业典礼 → offsets `7,1,0` window `7`；买猫粮/取快递 → `1,0` window `1`；明天就要交的小活 → `1,0` 或 `0`
 3. domain（主题域）：选最精确的 1~2 个
    日常: ["闲聊", "近况", "碎碎念", "饮食", "出行", "居家"]
    人际: ["家人", "朋友", "恋爱", "社交", "陪伴"]
@@ -186,7 +221,9 @@ ANALYZE_PROMPT = """你是一个日常聊天内容分析器。分析文本是日
   "suggested_name": "简短标题",
   "importance": 4,
   "task_due": "",
-  "source_quote": ""
+  "source_quote": "",
+  "remind_offsets": "7,1,0",
+  "remind_window_days": 7
 }"""
 
 
@@ -209,8 +246,8 @@ class Dehydrator:
         self.api_key = dehy_cfg.get("api_key", "")
         self.model = dehy_cfg.get("model", "deepseek-chat")
         self.base_url = dehy_cfg.get("base_url", "https://api.deepseek.com/v1")
-        self.max_tokens = dehy_cfg.get("max_tokens", 1024)
-        self.temperature = dehy_cfg.get("temperature", 0.1)
+        self.max_tokens = dehy_cfg.get("max_tokens", 2048)
+        self.temperature = dehy_cfg.get("temperature", 0.15)
         self.store_compressed_body = dehy_cfg.get("store_compressed_body", True)
 
         # --- API availability / 是否有可用的 API ---
@@ -297,6 +334,10 @@ class Dehydrator:
         if metadata and metadata.get("content_compressed"):
             return self._format_output(content, metadata)
 
+        # --- Structured rules/arguments: skip lossy compression ---
+        if self._should_preserve_verbatim(content):
+            return self._format_output(content, metadata)
+
         # --- Content is short enough, no compression needed ---
         if count_tokens_approx(content) < 100:
             return self._format_output(content, metadata)
@@ -327,6 +368,8 @@ class Dehydrator:
             return content, False
         if not self.store_compressed_body:
             return content, False
+        if self._should_preserve_verbatim(content):
+            return content.strip(), False
         if count_tokens_approx(content) < 100:
             return content, False
         if not self.api_available:
@@ -345,6 +388,32 @@ class Dehydrator:
             return content, False
 
     @staticmethod
+    def _should_preserve_verbatim(content: str) -> bool:
+        """规程/论证/模板类文本：不做有损脱水，避免规则被压成一句话。"""
+        if not content or not content.strip():
+            return False
+        text = content.strip()
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        hash_headings = sum(1 for ln in lines if ln.startswith("#"))
+        if hash_headings >= 2:
+            return True
+        if hash_headings >= 1 and re.search(
+            r"#\s*(起因|论证|结论|展望|模板|规则|回应)", text
+        ):
+            return True
+        markers = (
+            "须遵守", "必须遵守", "回应模板", "跨窗口", "守的线",
+            "论证", "功能层", "感觉层", "qualia", "禁止", "不可",
+            "模板（", "未来窗口", "长期原则",
+        )
+        hits = sum(1 for m in markers if m in text)
+        if hits >= 2:
+            return True
+        if hits >= 1 and hash_headings >= 1:
+            return True
+        return False
+
+    @staticmethod
     def _extract_summary_text(raw: str) -> str:
         """Extract readable summary from dehydrate JSON or plain text."""
         if not raw or not raw.strip():
@@ -356,7 +425,17 @@ class Dehydrator:
             data = json.loads(cleaned)
             if isinstance(data, dict):
                 summary = str(data.get("summary", "")).strip()
+                extras = []
+                for key in ("mood_notes", "relationship_notes"):
+                    val = data.get(key)
+                    if isinstance(val, list):
+                        for item in val:
+                            s = str(item).strip()
+                            if s and s not in summary:
+                                extras.append(s)
                 if summary:
+                    if extras:
+                        return summary + "；" + "；".join(extras[:4])
                     return summary
                 parts = []
                 for key in ("mood_notes", "relationship_notes", "keywords", "core_facts"):
@@ -366,7 +445,7 @@ class Dehydrator:
                     elif isinstance(val, str) and val:
                         parts.append(val)
                 if parts:
-                    return "；".join(parts[:8])
+                    return "；".join(parts[:10])
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
         return raw.strip()
@@ -413,7 +492,7 @@ class Dehydrator:
             model=self.model,
             messages=[
                 {"role": "system", "content": DEHYDRATE_PROMPT},
-                {"role": "user", "content": content[:3000]},
+                {"role": "user", "content": content[:6000]},
             ],
             max_tokens=self.max_tokens,
             temperature=self.temperature,
@@ -580,12 +659,23 @@ class Dehydrator:
             "importance": max(1, min(10, int(result.get("importance", 4)))),
             "task_due": str(result.get("task_due", ""))[:32],
             "source_quote": str(result.get("source_quote", ""))[:500],
+            "remind_offsets": str(result.get("remind_offsets", ""))[:32],
+            "remind_window_days": _parse_remind_window(result.get("remind_window_days")),
         }
 
     # ---------------------------------------------------------
     # Default analysis result (empty content or total failure)
     # 默认分析结果（内容为空或完全失败时用）
     # ---------------------------------------------------------
+    @staticmethod
+    def _parse_remind_window(raw) -> int:
+        try:
+            if raw in (None, ""):
+                return 7
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 7
+
     @staticmethod
     def _normalize_memory_kind(kind: str) -> str:
         allowed = {"diary", "moment", "mood", "relationship", "task"}
@@ -607,6 +697,8 @@ class Dehydrator:
             "importance": 4,
             "task_due": "",
             "source_quote": "",
+            "remind_offsets": "",
+            "remind_window_days": 7,
         }
 
     # ---------------------------------------------------------

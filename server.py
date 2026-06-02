@@ -57,6 +57,7 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from diary_ledger import DiaryLedger, ledger_to_api_dict
 from diary_tags import diary_section_label, ledger_mirror_tags, parse_tags_param
+from task_reminder import candidate_to_api_dict, finalize_task_reminder_fields, list_reminder_candidates
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
@@ -110,7 +111,7 @@ import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  
 DIARY_CFG = config.get("diary_mode", {})
 DIARY_MODE = DIARY_CFG.get("enabled", config.get("personality", {}).get("mode") == "diary")
 SURFACE_RECENT_DAYS = int(DIARY_CFG.get("surface_recent_days", 7))
-MAX_TASK_SURFACING = int(DIARY_CFG.get("max_task_surfacing", 3))
+MAX_TASK_SURFACING = int(DIARY_CFG.get("max_task_surfacing", 0))
 DEFAULT_DIARY_IMPORTANCE = int(DIARY_CFG.get("default_diary_importance", 4))
 
 
@@ -151,6 +152,9 @@ def _bucket_api_dict(b: dict, include_content: bool = False) -> dict:
         "resolved": meta.get("resolved", False),
         "task_status": meta.get("task_status"),
         "task_due": meta.get("task_due", ""),
+        "remind_offsets": meta.get("remind_offsets", ""),
+        "remind_window_days": meta.get("remind_window_days", ""),
+        "last_reminded_offset": meta.get("last_reminded_offset", ""),
         "source_quote": meta.get("source_quote", ""),
         "inferred": meta.get("inferred", False),
         "session_id": meta.get("session_id", ""),
@@ -534,6 +538,8 @@ async def _merge_or_create(
     task_status: str = "open",
     task_due: str = "",
     source_quote: str = "",
+    remind_offsets: str = "",
+    remind_window_days: str = "",
     inferred: bool = True,
     session_id: str = "",
 ) -> tuple[str, bool]:
@@ -588,6 +594,10 @@ async def _merge_or_create(
                 update_kwargs["task_due"] = task_due
             if memory_kind == "task" and source_quote:
                 update_kwargs["source_quote"] = source_quote
+            if memory_kind == "task" and remind_offsets:
+                update_kwargs["remind_offsets"] = remind_offsets
+            if memory_kind == "task" and remind_window_days:
+                update_kwargs["remind_window_days"] = remind_window_days
             await bucket_mgr.update(bucket["id"], **update_kwargs)
             try:
                 await embedding_engine.generate_and_store(bucket["id"], merged_body)
@@ -611,6 +621,8 @@ async def _merge_or_create(
         task_status=task_status,
         task_due=task_due,
         source_quote=source_quote,
+        remind_offsets=remind_offsets,
+        remind_window_days=remind_window_days,
         inferred=inferred,
         session_id=session_id,
         original_content=raw,
@@ -671,7 +683,7 @@ async def _build_diary_surfacing(max_tokens: int, max_results: int) -> str:
             -decay_engine.calculate_score(b["metadata"]),
         )
     )
-    open_tasks = open_tasks[:MAX_TASK_SURFACING]
+    open_tasks = open_tasks[:MAX_TASK_SURFACING] if MAX_TASK_SURFACING > 0 else []
 
     token_budget = max_tokens
     for r in pinned_results:
@@ -1069,10 +1081,12 @@ async def hold(
     memory_kind: str = "",
     task_due: str = "",
     source_quote: str = "",
+    remind_offsets: str = "",
+    remind_window_days: int = -1,
     session_id: str = "",
     inferred: bool = True,
 ) -> str:
-    """存储单条记忆。日常聊天被动记录用默认即可; task时设memory_kind=task。feel=True写感受。无需用户下命令,聊天有价值就静默写入。"""
+    """存储单条记忆。task 时设 memory_kind=task、task_due，并由你决定 remind_offsets / remind_window_days（ddl 提醒窗口）。feel=True 写感受。"""
     await decay_engine.ensure_started()
 
     if not content or not content.strip():
@@ -1122,6 +1136,7 @@ async def hold(
             "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
             "tags": [], "suggested_name": "", "importance": DEFAULT_DIARY_IMPORTANCE,
             "task_due": "", "source_quote": "",
+            "remind_offsets": "", "remind_window_days": 7,
         }
 
     domain = analysis["domain"]
@@ -1141,12 +1156,23 @@ async def hold(
     final_task_due = task_due or analysis.get("task_due", "")
     final_source_quote = source_quote or analysis.get("source_quote", "")
 
+    task_remind_off = ""
+    task_remind_win = ""
+    if final_kind == "task":
+        task_remind_off, task_remind_win = finalize_task_reminder_fields(
+            remind_offsets=remind_offsets,
+            remind_window_days=remind_window_days,
+            analysis=analysis,
+            name=suggested_name,
+            content=content,
+        )
+
     all_tags = list(dict.fromkeys(auto_tags + extra_tags))
 
     if pinned:
-        body, raw, compressed = await _storage_body(content)
+        raw = content.strip()
         bucket_id = await bucket_mgr.create(
-            content=body,
+            content=raw,
             tags=all_tags,
             importance=10,
             domain=domain,
@@ -1158,10 +1184,10 @@ async def hold(
             memory_kind=final_kind if final_kind != "task" else "diary",
             session_id=session_id,
             original_content=raw,
-            content_is_compressed=compressed,
+            content_is_compressed=False,
         )
         try:
-            await embedding_engine.generate_and_store(bucket_id, body)
+            await embedding_engine.generate_and_store(bucket_id, raw)
         except Exception:
             pass
         return f"📌钉选→{bucket_id} {','.join(domain)}"
@@ -1177,6 +1203,8 @@ async def hold(
         memory_kind=final_kind,
         task_due=final_task_due,
         source_quote=final_source_quote,
+        remind_offsets=task_remind_off,
+        remind_window_days=task_remind_win,
         inferred=inferred,
         session_id=session_id,
     )
@@ -1217,6 +1245,21 @@ async def grow(content: str) -> str:
                 "tags": [], "suggested_name": "", "importance": DEFAULT_DIARY_IMPORTANCE,
                 "task_due": "", "source_quote": "",
             }
+        mk = analysis.get("memory_kind", "diary")
+        ro, rw = "", ""
+        if mk == "task":
+            rw_in = analysis.get("remind_window_days", -1)
+            try:
+                rw_in = int(rw_in) if rw_in not in (None, "") else -1
+            except (TypeError, ValueError):
+                rw_in = -1
+            ro, rw = finalize_task_reminder_fields(
+                remind_offsets=str(analysis.get("remind_offsets", "")),
+                remind_window_days=rw_in,
+                analysis=analysis,
+                name=analysis.get("suggested_name", ""),
+                content=content.strip(),
+            )
         result_name, is_merged = await _merge_or_create(
             content=content.strip(),
             tags=analysis.get("tags", []),
@@ -1225,9 +1268,11 @@ async def grow(content: str) -> str:
             valence=analysis.get("valence", 0.5),
             arousal=analysis.get("arousal", 0.3),
             name=analysis.get("suggested_name", ""),
-            memory_kind=analysis.get("memory_kind", "diary"),
+            memory_kind=mk,
             task_due=analysis.get("task_due", ""),
             source_quote=analysis.get("source_quote", ""),
+            remind_offsets=ro,
+            remind_window_days=rw,
         )
         await _mirror_to_ledger(
             content.strip(),
@@ -1256,6 +1301,21 @@ async def grow(content: str) -> str:
     # --- 逐条合并或新建（单条失败不影响其他）---
     for item in items:
         try:
+            mk = item.get("memory_kind", "diary")
+            ro, rw = "", ""
+            if mk == "task":
+                rw_in = item.get("remind_window_days", -1)
+                try:
+                    rw_in = int(rw_in) if rw_in not in (None, "") else -1
+                except (TypeError, ValueError):
+                    rw_in = -1
+                ro, rw = finalize_task_reminder_fields(
+                    remind_offsets=str(item.get("remind_offsets", "")),
+                    remind_window_days=rw_in,
+                    analysis=item,
+                    name=item.get("name", ""),
+                    content=item["content"],
+                )
             result_name, is_merged = await _merge_or_create(
                 content=item["content"],
                 tags=item.get("tags", []),
@@ -1264,9 +1324,11 @@ async def grow(content: str) -> str:
                 valence=item.get("valence", 0.5),
                 arousal=item.get("arousal", 0.3),
                 name=item.get("name", ""),
-                memory_kind=item.get("memory_kind", "diary"),
+                memory_kind=mk,
                 task_due=item.get("task_due", ""),
                 source_quote=item.get("source_quote", ""),
+                remind_offsets=ro,
+                remind_window_days=rw,
                 inferred=True,
             )
 
@@ -1655,6 +1717,8 @@ async def api_hold(request):
             memory_kind=body.get("memory_kind", ""),
             task_due=body.get("task_due", ""),
             source_quote=body.get("source_quote", ""),
+            remind_offsets=body.get("remind_offsets", ""),
+            remind_window_days=int(body.get("remind_window_days", -1)),
             session_id=body.get("session_id", ""),
             inferred=bool(body.get("inferred", True)),
         )
@@ -2022,6 +2086,21 @@ async def api_generate_daily_diary(request):
     )
 
 
+@mcp.custom_route("/api/tasks/reminder-due", methods=["GET"])
+async def api_tasks_reminder_due(request):
+    """System scan: open tasks whose DDL key node (7d/1d/today) is due now."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        buckets = await bucket_mgr.filter_buckets(memory_kind="task", task_status="open")
+        candidates = list_reminder_candidates(buckets)
+        return JSONResponse([candidate_to_api_dict(c) for c in candidates])
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @mcp.custom_route("/api/tasks", methods=["GET"])
 async def api_tasks(request):
     """Task list for frontend todo view."""
@@ -2060,19 +2139,35 @@ async def api_task_update(request):
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-    status = body.get("status", "")
-    if status not in ("open", "done", "cancelled"):
+    status = (body.get("status") or "").strip()
+    if status and status not in ("open", "done", "cancelled"):
         return JSONResponse({"error": "status must be open/done/cancelled"}, status_code=400)
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket:
         return JSONResponse({"error": "not found"}, status_code=404)
     if not bucket_mgr.is_task_kind(bucket["metadata"].get("memory_kind")):
         return JSONResponse({"error": "not a task bucket"}, status_code=400)
-    updates = {"task_status": status}
-    if status == "done":
-        updates["resolved"] = True
-    elif status == "open":
-        updates["resolved"] = False
+    updates = {}
+    if status:
+        updates["task_status"] = status
+        if status == "done":
+            updates["resolved"] = True
+        elif status == "open":
+            updates["resolved"] = False
+    if "remind_offsets" in body:
+        updates["remind_offsets"] = str(body.get("remind_offsets", ""))[:32]
+    if "remind_window_days" in body:
+        try:
+            updates["remind_window_days"] = str(max(0, int(body.get("remind_window_days"))))
+        except (TypeError, ValueError):
+            pass
+    if "last_reminded_offset" in body:
+        try:
+            updates["last_reminded_offset"] = str(int(body.get("last_reminded_offset")))
+        except (TypeError, ValueError):
+            pass
+    if not updates:
+        return JSONResponse({"error": "no updates"}, status_code=400)
     ok = await bucket_mgr.update(bucket_id, **updates)
     if not ok:
         return JSONResponse({"error": "update failed"}, status_code=500)
